@@ -1,0 +1,22 @@
+[package]
+name = "fft-wasm-lib"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/delta_kimigatame/fft-wasm-lib"
+homepage = "https://github.com/delta_kimigatame/fft-wasm-lib"
+keywords = ["fft", "wasm", "audio", "frequency"]
+categories = ["wasm", "audio", "signal-processing"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+num-complex = "0.4"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = 3     # サイズ優先なら "z"、速度優先なら "3"
+lto = true        # リンカ最適化を有効に
+codegen-units = 1 # コード分割を最小にして最適化効果を高める
+panic = "abort"   # パニック時のコードサイズを削減
