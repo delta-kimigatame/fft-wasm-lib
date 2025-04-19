@@ -12,11 +12,19 @@ categories = ["wasm", "audio", "signal-processing"]
 wasm-bindgen = "0.2"
 num-complex = "0.4"
 
+[dev-dependencies]
+criterion = "0.4"
+
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [profile.release]
 opt-level = 3     # サイズ優先なら "z"、速度優先なら "3"
 lto = true        # リンカ最適化を有効に
 codegen-units = 1 # コード分割を最小にして最適化効果を高める
 panic = "abort"   # パニック時のコードサイズを削減
+
+[[bench]]
+name = "spectrogram_bench"
+path = "benches/spectrogram_bench.rs"
+harness = false
