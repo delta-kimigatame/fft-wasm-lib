@@ -2,11 +2,6 @@ use wasm_bindgen::prelude::*;
 use num_complex::Complex;
 use std::{ f32::consts::PI };
 
-#[cfg(all(feature = "simd", target_arch = "wasm32"))]
-use core::arch::wasm32::{
-    f32x2, f32x2_add, f32x2_mul, f32x2_sub, f32x2_extract_lane,
-};
-
 /// 2進数表現のビットを逆転します。
 ///
 /// # 引数
@@ -76,7 +71,6 @@ impl FFT {
     /// # 引数
     /// - `get_input` 変換元のデータ
     /// - `twiddle`:回転因子
-    #[cfg(feature = "basic")]
     fn fftin_core<F>(&self, get_input: F, twiddle: &[Complex<f32>]) -> Vec<Complex<f32>>
     where
         F: Fn(usize) -> Complex<f32>,
@@ -98,83 +92,6 @@ impl FFT {
                     let r = rec[s + i + step] * twiddle[span * i];
                     rec[s + i] = l + r;
                     rec[s + i + step] = l - r;
-                }
-            }
-            step *= 2;
-        }
-
-        rec
-    }
-    
-    /// FFTの共通処理部分の、元のデータが実数か複素数かに依らず固定の部分
-    /// # 引数
-    /// - `get_input` 変換元のデータ
-    /// - `twiddle`:回転因子
-    #[cfg(feature = "simd")]
-    fn fftin_core<F>(&self, get_input: F, twiddle: &[Complex<f32>]) -> Vec<Complex<f32>>
-    where
-        F: Fn(usize) -> Complex<f32>,
-    {
-        // 1) ビット逆転順で初期化
-        let mut rec = Vec::with_capacity(self.size);
-        for &idx in &self.rev_indices {
-            rec.push(get_input(idx));
-        }
-
-        // 2) 蝶形演算ループ
-        let mut span = self.size;
-        let mut step = 1;
-        while step < self.size {
-            span /= 2;
-            for s in (0..self.size).step_by(step * 2) {
-                let mut i = 0;
-                while i + 1 < step {
-                    // 左側の 2 要素  
-                    let l0 = rec[s + i];
-                    let l1 = rec[s + i + 1];
-                    // 右側の 2 要素 × 回転因子  
-                    let r0 = rec[s + i + step] * twiddle[span * i];
-                    let r1 = rec[s + i + 1 + step] * twiddle[span * (i + 1)];
-
-                    // f32x2 ベクトルにパック
-                    let l_re = f32x2(l0.re, l1.re);
-                    let l_im = f32x2(l0.im, l1.im);
-                    let r_re = f32x2(r0.re, r1.re);
-                    let r_im = f32x2(r0.im, r1.im);
-
-                    // ベクトル演算で同時に和/差を計算
-                    let sum_re  = f32x2_add(l_re, r_re);
-                    let sum_im  = f32x2_add(l_im, r_im);
-                    let diff_re = f32x2_sub(l_re, r_re);
-                    let diff_im = f32x2_sub(l_im, r_im);
-
-                    // ベクトルからスカラーへ展開して書き戻し
-                    rec[s + i]             = Complex::new(
-                        f32x2_extract_lane::<0>(sum_re),
-                        f32x2_extract_lane::<0>(sum_im),
-                    );
-                    rec[s + i + 1]         = Complex::new(
-                        f32x2_extract_lane::<1>(sum_re),
-                        f32x2_extract_lane::<1>(sum_im),
-                    );
-                    rec[s + i + step]      = Complex::new(
-                        f32x2_extract_lane::<0>(diff_re),
-                        f32x2_extract_lane::<0>(diff_im),
-                    );
-                    rec[s + i + 1 + step]  = Complex::new(
-                        f32x2_extract_lane::<1>(diff_re),
-                        f32x2_extract_lane::<1>(diff_im),
-                    );
-
-                    i += 2;
-                }
-
-                // フォールバック：要素数が奇数だった場合の残り１要素は scalar で
-                for j in i..step {
-                    let l = rec[s + j];
-                    let r = rec[s + j + step] * twiddle[span * j];
-                    rec[s + j]         = l + r;
-                    rec[s + j + step]  = l - r;
                 }
             }
             step *= 2;
@@ -220,6 +137,10 @@ impl FFT {
     }
 
 }
+
+/// 実数に限定する代わりに高速に動作するFFT ライブラリを表す構造体
+///
+/// この構造体は、事前に計算した回転因子やビット逆転インデックスを保持する。
 pub struct RealFft {
     full: FFT,                     // N-point FFT（今後の ifft でも使える）
     half: FFT,                     // N/2-point FFT
@@ -227,6 +148,10 @@ pub struct RealFft {
 }
 
 impl RealFft {
+    /// コンストラクタ
+    ///
+    /// # 引数
+    /// - `size`:fftのサイズ。
     pub fn new(size: usize) -> Self {
         assert!(size.is_power_of_two());
         let full = FFT::new(size);
@@ -241,6 +166,13 @@ impl RealFft {
         RealFft { full, half, rfft_twiddle }
     }
 
+    /// 実数データ f を入力として FFT を行い、周波数スペクトル (Complex 配列) を返す。
+    /// # 引数
+    /// - `&self`
+    /// - `real`:実数限定
+    ///
+    /// # 戻り値
+    /// 周波数スペクトル (Complex 配列)
     pub fn rfft(&self, real: &[f32]) -> Vec<Complex<f32>> {
         let n = self.full.size;
         let nh = n / 2;
