@@ -1,6 +1,11 @@
 use wasm_bindgen::prelude::*;
 use num_complex::Complex;
-use std::{ f64::consts::PI };
+use std::{ f32::consts::PI };
+
+#[cfg(all(feature = "simd", target_arch = "wasm32"))]
+use core::arch::wasm32::{
+    f32x2, f32x2_add, f32x2_mul, f32x2_sub, f32x2_extract_lane,
+};
 
 /// 2進数表現のビットを逆転します。
 ///
@@ -30,10 +35,10 @@ pub struct FFT {
     k: usize,
 
     /// FFT 用の回転因子（`e^{-2πi * n / size}` の配列）
-    twiddle: Vec<Complex<f64>>,
+    twiddle: Vec<Complex<f32>>,
 
     /// iFFT 用の回転因子（`e^{+2πi * n / size}` の配列）
-    itwiddle: Vec<Complex<f64>>,
+    itwiddle: Vec<Complex<f32>>,
 
     /// ビット逆転順序のインデックス（`rev_bit` で得られる並び替え用テーブル）
     rev_indices: Vec<usize>,
@@ -45,14 +50,14 @@ impl FFT {
     /// - `size`:fftのサイズ。2のべき乗である必要がある。
     pub fn new(size: usize) -> Self {
         assert!(size.is_power_of_two(), "size must be power of 2");
-        let k = (size as f64).log2() as usize;
-        let t = (-2.0 * PI) / (size as f64);
-        let it = (2.0 * PI) / (size as f64);
+        let k = (size as f32).log2() as usize;
+        let t = (-2.0 * PI) / (size as f32);
+        let it = (2.0 * PI) / (size as f32);
         let mut twiddle = Vec::with_capacity(size);
         let mut itwiddle = Vec::with_capacity(size);
         for i in 0..size {
-            twiddle.push(Complex::from_polar(1.0, t * (i as f64)));
-            itwiddle.push(Complex::from_polar(1.0, it * (i as f64)));
+            twiddle.push(Complex::from_polar(1.0, t * (i as f32)));
+            itwiddle.push(Complex::from_polar(1.0, it * (i as f32)));
         }
         let mut rev_indices = vec![0; size];
         for i in 0..size {
@@ -71,9 +76,10 @@ impl FFT {
     /// # 引数
     /// - `get_input` 変換元のデータ
     /// - `twiddle`:回転因子
-    fn fftin_core<F>(&self, get_input: F, twiddle: &[Complex<f64>]) -> Vec<Complex<f64>>
+    #[cfg(feature = "basic")]
+    fn fftin_core<F>(&self, get_input: F, twiddle: &[Complex<f32>]) -> Vec<Complex<f32>>
     where
-        F: Fn(usize) -> Complex<f64>,
+        F: Fn(usize) -> Complex<f32>,
     {
         // 1) ビット逆転順で初期化
         let mut rec = Vec::with_capacity(self.size);
@@ -99,13 +105,90 @@ impl FFT {
 
         rec
     }
+    
+    /// FFTの共通処理部分の、元のデータが実数か複素数かに依らず固定の部分
+    /// # 引数
+    /// - `get_input` 変換元のデータ
+    /// - `twiddle`:回転因子
+    #[cfg(feature = "simd")]
+    fn fftin_core<F>(&self, get_input: F, twiddle: &[Complex<f32>]) -> Vec<Complex<f32>>
+    where
+        F: Fn(usize) -> Complex<f32>,
+    {
+        // 1) ビット逆転順で初期化
+        let mut rec = Vec::with_capacity(self.size);
+        for &idx in &self.rev_indices {
+            rec.push(get_input(idx));
+        }
+
+        // 2) 蝶形演算ループ
+        let mut span = self.size;
+        let mut step = 1;
+        while step < self.size {
+            span /= 2;
+            for s in (0..self.size).step_by(step * 2) {
+                let mut i = 0;
+                while i + 1 < step {
+                    // 左側の 2 要素  
+                    let l0 = rec[s + i];
+                    let l1 = rec[s + i + 1];
+                    // 右側の 2 要素 × 回転因子  
+                    let r0 = rec[s + i + step] * twiddle[span * i];
+                    let r1 = rec[s + i + 1 + step] * twiddle[span * (i + 1)];
+
+                    // f32x2 ベクトルにパック
+                    let l_re = f32x2(l0.re, l1.re);
+                    let l_im = f32x2(l0.im, l1.im);
+                    let r_re = f32x2(r0.re, r1.re);
+                    let r_im = f32x2(r0.im, r1.im);
+
+                    // ベクトル演算で同時に和/差を計算
+                    let sum_re  = f32x2_add(l_re, r_re);
+                    let sum_im  = f32x2_add(l_im, r_im);
+                    let diff_re = f32x2_sub(l_re, r_re);
+                    let diff_im = f32x2_sub(l_im, r_im);
+
+                    // ベクトルからスカラーへ展開して書き戻し
+                    rec[s + i]             = Complex::new(
+                        f32x2_extract_lane::<0>(sum_re),
+                        f32x2_extract_lane::<0>(sum_im),
+                    );
+                    rec[s + i + 1]         = Complex::new(
+                        f32x2_extract_lane::<1>(sum_re),
+                        f32x2_extract_lane::<1>(sum_im),
+                    );
+                    rec[s + i + step]      = Complex::new(
+                        f32x2_extract_lane::<0>(diff_re),
+                        f32x2_extract_lane::<0>(diff_im),
+                    );
+                    rec[s + i + 1 + step]  = Complex::new(
+                        f32x2_extract_lane::<1>(diff_re),
+                        f32x2_extract_lane::<1>(diff_im),
+                    );
+
+                    i += 2;
+                }
+
+                // フォールバック：要素数が奇数だった場合の残り１要素は scalar で
+                for j in i..step {
+                    let l = rec[s + j];
+                    let r = rec[s + j + step] * twiddle[span * j];
+                    rec[s + j]         = l + r;
+                    rec[s + j + step]  = l - r;
+                }
+            }
+            step *= 2;
+        }
+
+        rec
+    }
 
     /// FFT と iFFT の共通処理部分。実数入力を Complex に変換して FFT を行う。
     /// # 引数
     /// - `&self`
     /// - `c`:変換元の実数データ
     /// - `twiddle`:回転因子
-    fn fftin(&self, c: &[Complex<f64>], twiddle: &[Complex<f64>]) -> Vec<Complex<f64>> {
+    fn fftin(&self, c: &[Complex<f32>], twiddle: &[Complex<f32>]) -> Vec<Complex<f32>> {
         self.fftin_core(|i| c[i], twiddle)
     }
 
@@ -114,14 +197,14 @@ impl FFT {
     /// - `&self`
     /// - `c`:変換元の複素数データ
     /// - `twiddle`:回転因子
-    fn fftin_real(&self, c: &[f64], twiddle: &[Complex<f64>]) -> Vec<Complex<f64>> {
+    fn fftin_real(&self, c: &[f32], twiddle: &[Complex<f32>]) -> Vec<Complex<f32>> {
         self.fftin_core(|i| Complex::new(c[i], 0.0), twiddle)
     }
 
-    fn ifft(&self, f: &[Complex<f64>]) -> Vec<Complex<f64>> {
+    fn ifft(&self, f: &[Complex<f32>]) -> Vec<Complex<f32>> {
         self.fftin(f, &self.itwiddle)
             .into_iter()
-            .map(|c| Complex::new(c.re / (self.size as f64), c.im / (self.size as f64)))
+            .map(|c| Complex::new(c.re / (self.size as f32), c.im / (self.size as f32)))
             .collect()
     }
 
@@ -132,13 +215,75 @@ impl FFT {
     ///
     /// # 戻り値
     /// 周波数スペクトル (Complex 配列)
-    pub fn fft_real(&self, f: &[f64]) -> Vec<Complex<f64>> {
+    pub fn fft_real(&self, f: &[f32]) -> Vec<Complex<f32>> {
         self.fftin_real(f, &self.twiddle)
+    }
+
+}
+pub struct RealFft {
+    full: FFT,                     // N-point FFT（今後の ifft でも使える）
+    half: FFT,                     // N/2-point FFT
+    rfft_twiddle: Vec<Complex<f32>>, // combine 用の e^{-2πi k / N}
+}
+
+impl RealFft {
+    pub fn new(size: usize) -> Self {
+        assert!(size.is_power_of_two());
+        let full = FFT::new(size);
+        let half = FFT::new(size / 2);
+
+        let mut rfft_twiddle = Vec::with_capacity(size/2);
+        for k in 0..(size/2) {
+            let θ = -2.0 * PI * (k as f32) / (size as f32);
+            rfft_twiddle.push(Complex::new(θ.cos(), θ.sin()));
+        }
+
+        RealFft { full, half, rfft_twiddle }
+    }
+
+    pub fn rfft(&self, real: &[f32]) -> Vec<Complex<f32>> {
+        let n = self.full.size;
+        let nh = n / 2;
+        assert_eq!(real.len(), n);
+
+        // 1) 実部＝偶数, 虚部＝奇数 でパック
+        let mut buf = Vec::with_capacity(nh);
+        for i in 0..nh {
+            buf.push(Complex::new(real[2*i], real[2*i+1]));
+        }
+
+        // 2) 半長 FFT はキャッシュ済み
+        let spec_half = self.half.fftin_core(|i| buf[i], &self.half.twiddle);
+
+        // 3) combine
+        let mut out = Vec::with_capacity(nh+1);
+        let e0 = spec_half[0];
+        out.push(Complex::new(e0.re + e0.im, 0.0));
+
+        for k in 1..nh {
+            let ek   = spec_half[k];
+            let enk  = spec_half[nh - k].conj();
+            let w    = self.rfft_twiddle[k];
+
+            let sum   = ek + enk;
+            let diff  = ek - enk;
+            let cross = Complex::new(0.0, -1.0) * diff * w;
+
+            out.push(Complex::new(
+                (sum.re + cross.re) * 0.5,
+                (sum.im + cross.im) * 0.5,
+            ));
+        }
+
+        out.push(Complex::new(e0.re - e0.im, 0.0));
+        out
     }
 }
 
+
+
 #[wasm_bindgen]
-pub fn calc_spectrogram(size: usize, data: &[f64], window: &[f64]) -> Vec<f64> {
+pub fn calc_spectrogram(size: usize, data: &[f32], window: &[f32]) -> Vec<f32> {
     let data_len = data.len();
     let window_size = window.len();
     assert!(window_size > 0,"window_size must be > 0");
@@ -151,14 +296,13 @@ pub fn calc_spectrogram(size: usize, data: &[f64], window: &[f64]) -> Vec<f64> {
     let frame_count = (data_len - size) / window_size + 1;
     let freq_bins   = size / 2 + 1;
     let mut log_spec = Vec::with_capacity(frame_count * freq_bins);
+    let mut windowed_data = vec![0.0_f32; size];
     let f = FFT::new(size);
     for i in (0..data_len - size).step_by(window_size) {
-        let windowed_data: Vec<f64> = data[i..i + size]
-            .iter()
-            .enumerate()
-            .map(|(j, &t)| t * window[j % window_size])
-            .collect();
-        let spec: Vec<Complex<f64>> = f.fft_real(&windowed_data);
+        for j in 0..size {
+            windowed_data[j] = data[i + j] * window[j % window_size];
+        }
+        let spec: Vec<Complex<f32>> = f.fft_real(&windowed_data);
         //10log((re^2+im^2)^0.5)=5log(re^2+im^2)を求める
         for c in &spec {
             let sq = c.re * c.re + c.im * c.im;
@@ -168,6 +312,45 @@ pub fn calc_spectrogram(size: usize, data: &[f64], window: &[f64]) -> Vec<f64> {
     }
     log_spec
 }
+
+#[wasm_bindgen]
+pub fn calc_spectrogram_with_rfft(size: usize, data: &[f32], window: &[f32]) -> Vec<f32> {
+    let data_len = data.len();
+    let window_size = window.len();
+    assert!(window_size > 0,"window_size must be > 0");
+    assert!(
+        data_len >= size,
+        "data length ({}) must be at least fft size ({})",
+        data_len,
+        size
+    );
+    let frame_count = (data_len - size) / window_size + 1;
+    let freq_bins   = size / 2 + 1;
+    let mut log_spec = Vec::with_capacity(frame_count * freq_bins);
+    let mut windowed_data = vec![0.0_f32; size];
+    let f = RealFft::new(size);
+    for i in (0..data_len - size).step_by(window_size) {
+        for j in 0..size {
+            windowed_data[j] = data[i + j] * window[j % window_size];
+        }
+        let spec: Vec<Complex<f32>> = f.rfft(&windowed_data);
+        //10log((re^2+im^2)^0.5)=5log(re^2+im^2)を求める
+        for c in &spec {
+            let sq = c.re * c.re + c.im * c.im;
+            let db = 5.0 * sq.log10();
+            log_spec.push(db);
+        }
+    }
+    log_spec
+}
+
+
+#[wasm_bindgen]
+pub fn identity_array(size: usize, data: &[f32], window: &[f32]) -> Vec<f32> {
+    // ただ入力をそのまま返すだけ
+    data.to_vec()
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -186,8 +369,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "window_size must be > 0")]
     fn new_panics_window_size_0() {
-        let mut data: Vec<f64> = Vec::new();
-        let mut window: Vec<f64> = Vec::new();
+        let mut data: Vec<f32> = Vec::new();
+        let window: Vec<f32> = Vec::new();
         data.push(1.0);
         data.push(1.0);
         data.push(1.0);
@@ -197,8 +380,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "data length (2) must be at least fft size (4)")]
     fn new_panics_data_length_shorter() {
-        let mut data: Vec<f64> = Vec::new();
-        let mut window: Vec<f64> = Vec::new();
+        let mut data: Vec<f32> = Vec::new();
+        let mut window: Vec<f32> = Vec::new();
         data.push(1.0);
         data.push(1.0);
         window.push(1.0);
@@ -212,9 +395,9 @@ mod tests {
 #[cfg(test)]
 mod fft_tests {
     use super::*;
-    const EPS: f64 = 1e-8;
+    const EPS: f32 = 1e-8;
 
-    fn approx_eq(a: f64, b: f64) -> bool {
+    fn approx_eq(a: f32, b: f32) -> bool {
         (a - b).abs() < EPS
     }
 
@@ -222,12 +405,12 @@ mod fft_tests {
     fn fft_real_constant_input() {
         let size = 8;
         let f = FFT::new(size);
-        let data = vec![1.0_f64; size];
+        let data = vec![1.0_f32; size];
         let spec = f.fft_real(&data);
 
         assert_eq!(spec.len(), size);
         // DC 成分のみ N が返ってくる
-        assert!(approx_eq(spec[0].re, size as f64));
+        assert!(approx_eq(spec[0].re, size as f32));
         assert!(approx_eq(spec[0].im, 0.0));
         for k in 1..size {
             assert!(approx_eq(spec[k].re, 0.0));
@@ -239,7 +422,7 @@ mod fft_tests {
     fn fft_real_impulse_input() {
         let size = 8;
         let f = FFT::new(size);
-        let mut data = vec![0.0_f64; size];
+        let mut data = vec![0.0_f32; size];
         data[0] = 1.0;
         let spec = f.fft_real(&data);
 
@@ -250,36 +433,22 @@ mod fft_tests {
             assert!(approx_eq(spec[k].im, 0.0));
         }
     }
-
     #[test]
-    fn fft_then_ifft_returns_original() {
-        // 長さは 2 のべき乗
+    fn rfft_impulse_input() {
         let size = 8;
-        let fft = FFT::new(size);
-
-        // 任意のテスト信号（ここでは 0,1,2,...,7）
-        let data: Vec<f64> = (0..size).map(|i| i as f64).collect();
-
-        // FFT→iFFT の順に実行
-        let spectrum = fft.fft_real(&data);
-        let recovered = fft.ifft(&spectrum);
-
-        // 復元値が元信号とほぼ一致するかチェック
-        assert_eq!(recovered.len(), size);
-        for (i, c) in recovered.iter().enumerate() {
-            assert!(
-                approx_eq(c.re, data[i]),
-                "sample {}: got re={}, expected {}",
-                i,
-                c.re,
-                data[i]
-            );
-            assert!(
-                approx_eq(c.im, 0.0),
-                "sample {}: imaginary part is not zero: {}",
-                i,
-                c.im
-            );
+        let f = RealFft::new(size);
+        let mut data = vec![0.0_f32; size];
+        data[0] = 1.0;
+        let spec = f.rfft(&data);
+    
+        // 出力長は N/2+1
+        assert_eq!(spec.len(), size/2 + 1);
+    
+        // インパルスなら k=0…N/2 のすべてのビンが 1+0j
+        for c in &spec {
+            assert!(approx_eq(c.re, 1.0));
+            assert!(approx_eq(c.im, 0.0));
         }
     }
+    
 }

@@ -13,7 +13,18 @@ wasm-bindgen = "0.2"
 num-complex = "0.4"
 
 [dev-dependencies]
-criterion = "0.4"
+wasm-bindgen-test = "0.3"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+criterion = { version = "0.4", features = ["html_reports"] }
+
+[features]
+# デフォルトはスカラ実装（basic）
+default = ["basic"]
+# スカラ版 FFT 実装
+basic = []
+# SIMD 最適化版 FFT 実装
+simd = []
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -28,3 +39,7 @@ panic = "abort"   # パニック時のコードサイズを削減
 name = "spectrogram_bench"
 path = "benches/spectrogram_bench.rs"
 harness = false
+
+[[bench]]
+name = "fft_power_bench"
+path = "benches/fft_power_bench.rs"
