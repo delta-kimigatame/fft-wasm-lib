@@ -100,14 +100,6 @@ impl FFT {
         rec
     }
 
-    /// FFT と iFFT の共通処理部分。実数入力を Complex に変換して FFT を行う。
-    /// # 引数
-    /// - `&self`
-    /// - `c`:変換元の実数データ
-    /// - `twiddle`:回転因子
-    fn fftin(&self, c: &[Complex<f32>], twiddle: &[Complex<f32>]) -> Vec<Complex<f32>> {
-        self.fftin_core(|i| c[i], twiddle)
-    }
 
     /// FFT と iFFT の共通処理部分。
     /// # 引数
@@ -116,13 +108,6 @@ impl FFT {
     /// - `twiddle`:回転因子
     fn fftin_real(&self, c: &[f32], twiddle: &[Complex<f32>]) -> Vec<Complex<f32>> {
         self.fftin_core(|i| Complex::new(c[i], 0.0), twiddle)
-    }
-
-    fn ifft(&self, f: &[Complex<f32>]) -> Vec<Complex<f32>> {
-        self.fftin(f, &self.itwiddle)
-            .into_iter()
-            .map(|c| Complex::new(c.re / (self.size as f32), c.im / (self.size as f32)))
-            .collect()
     }
 
     /// 実数データ f を入力として FFT を行い、周波数スペクトル (Complex 配列) を返す。
@@ -212,39 +197,6 @@ impl RealFft {
     }
 }
 
-
-
-#[wasm_bindgen]
-pub fn calc_spectrogram(size: usize, data: &[f32], window: &[f32]) -> Vec<f32> {
-    let data_len = data.len();
-    let window_size = window.len();
-    assert!(window_size > 0,"window_size must be > 0");
-    assert!(
-        data_len >= size,
-        "data length ({}) must be at least fft size ({})",
-        data_len,
-        size
-    );
-    let frame_count = (data_len - size) / window_size + 1;
-    let freq_bins   = size / 2 + 1;
-    let mut log_spec = Vec::with_capacity(frame_count * freq_bins);
-    let mut windowed_data = vec![0.0_f32; size];
-    let f = FFT::new(size);
-    for i in (0..data_len - size).step_by(window_size) {
-        for j in 0..size {
-            windowed_data[j] = data[i + j] * window[j % window_size];
-        }
-        let spec: Vec<Complex<f32>> = f.fft_real(&windowed_data);
-        //10log((re^2+im^2)^0.5)=5log(re^2+im^2)を求める
-        for c in &spec {
-            let sq = c.re * c.re + c.im * c.im;
-            let db = 5.0 * sq.log10();
-            log_spec.push(db);
-        }
-    }
-    log_spec
-}
-
 #[wasm_bindgen]
 pub fn calc_spectrogram_with_rfft(size: usize, data: &[f32], window: &[f32]) -> Vec<f32> {
     let data_len = data.len();
@@ -276,14 +228,6 @@ pub fn calc_spectrogram_with_rfft(size: usize, data: &[f32], window: &[f32]) -> 
     log_spec
 }
 
-
-#[wasm_bindgen]
-pub fn identity_array(size: usize, data: &[f32], window: &[f32]) -> Vec<f32> {
-    // ただ入力をそのまま返すだけ
-    data.to_vec()
-}
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,7 +251,7 @@ mod tests {
         data.push(1.0);
         data.push(1.0);
         data.push(1.0);
-        calc_spectrogram(4, &data, &window);
+        calc_spectrogram_with_rfft(4, &data, &window);
     }
     #[test]
     #[should_panic(expected = "data length (2) must be at least fft size (4)")]
@@ -320,7 +264,7 @@ mod tests {
         window.push(1.0);
         window.push(1.0);
         window.push(1.0);
-        calc_spectrogram(4, &data, &window);
+        calc_spectrogram_with_rfft(4, &data, &window);
     }
 }
 
