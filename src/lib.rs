@@ -197,54 +197,32 @@ impl RealFft {
     }
 }
 
-#[wasm_bindgen]
-pub fn calc_spectrogram_with_rfft(size: usize, data: &[f32], window: &[f32]) -> Vec<f32> {
+fn calc_power_spectrogram_internal(
+    size: usize,
+    hop_length: usize,
+    data: &[f32],
+    window: &[f32],
+) -> (Vec<f32>, usize, usize) {
     let data_len = data.len();
     let window_size = window.len();
-    assert!(window_size > 0,"window_size must be > 0");
-    assert!(
-        data_len >= size,
-        "data length ({}) must be at least fft size ({})",
-        data_len,
-        size
-    );
-    let frame_count = (data_len - size) / window_size + 1;
-    let freq_bins   = size / 2 + 1;
-    let mut log_spec = Vec::with_capacity(frame_count * freq_bins);
-    let mut windowed_data = vec![0.0_f32; size];
-    let f = RealFft::new(size);
-    for i in (0..data_len - size).step_by(window_size) {
-        for j in 0..size {
-            windowed_data[j] = data[i + j] * window[j % window_size];
-        }
-        let spec: Vec<Complex<f32>> = f.rfft(&windowed_data);
-        //10log((re^2+im^2)^0.5)=5log(re^2+im^2)を求める
-        for c in &spec {
-            let sq = c.re * c.re + c.im * c.im;
-            let db = 5.0 * sq.log10();
-            log_spec.push(db);
-        }
-    }
-    log_spec
-}
-
-#[wasm_bindgen]
-pub fn calc_power_spectrogram_with_rfft(size: usize, data: &[f32], window: &[f32]) -> Vec<f32> {
-    let data_len = data.len();
-    let window_size = window.len();
+    assert!(size.is_power_of_two(), "size must be power of 2");
     assert!(window_size > 0, "window_size must be > 0");
+    assert!(hop_length > 0, "hop_length must be > 0");
     assert!(
         data_len >= size,
         "data length ({}) must be at least fft size ({})",
         data_len,
         size
     );
-    let frame_count = (data_len - size) / window_size + 1;
+
+    // frames = floor((len - n_fft) / hop) + 1
+    let frame_count = (data_len - size) / hop_length + 1;
     let freq_bins = size / 2 + 1;
     let mut power_spec = Vec::with_capacity(frame_count * freq_bins);
     let mut windowed_data = vec![0.0_f32; size];
     let f = RealFft::new(size);
-    for i in (0..=data_len - size).step_by(window_size) {
+
+    for i in (0..=data_len - size).step_by(hop_length) {
         for j in 0..size {
             windowed_data[j] = data[i + j] * window[j % window_size];
         }
@@ -254,7 +232,208 @@ pub fn calc_power_spectrogram_with_rfft(size: usize, data: &[f32], window: &[f32
             power_spec.push(sq);
         }
     }
+
+    (power_spec, frame_count, freq_bins)
+}
+
+fn hz_to_mel(hz: f32) -> f32 {
+    2595.0 * (1.0 + hz / 700.0).log10()
+}
+
+fn mel_to_hz(mel: f32) -> f32 {
+    700.0 * (10.0_f32.powf(mel / 2595.0) - 1.0)
+}
+
+fn build_mel_filterbank(
+    n_fft: usize,
+    n_mels: usize,
+    sample_rate: f32,
+    f_min: f32,
+    f_max: f32,
+) -> Vec<f32> {
+    let freq_bins = n_fft / 2 + 1;
+    let mut filterbank = vec![0.0_f32; n_mels * freq_bins];
+
+    let min_mel = hz_to_mel(f_min);
+    let max_mel = hz_to_mel(f_max);
+
+    let mel_points_count = n_mels + 2;
+    let mut hz_points = Vec::with_capacity(mel_points_count);
+    for i in 0..mel_points_count {
+        let t = i as f32 / (mel_points_count - 1) as f32;
+        let mel = min_mel + t * (max_mel - min_mel);
+        hz_points.push(mel_to_hz(mel));
+    }
+
+    let nyquist_bin = freq_bins - 1;
+    let mut bin_points = Vec::with_capacity(mel_points_count);
+    for hz in &hz_points {
+        let mut b = (((n_fft as f32 + 1.0) * *hz) / sample_rate).floor() as isize;
+        if b < 0 {
+            b = 0;
+        }
+        if b as usize > nyquist_bin {
+            b = nyquist_bin as isize;
+        }
+        bin_points.push(b as usize);
+    }
+
+    for m in 0..n_mels {
+        let left = bin_points[m];
+        let center = bin_points[m + 1];
+        let right = bin_points[m + 2];
+
+        if left < center {
+            let denom = (center - left) as f32;
+            for k in left..center {
+                let v = (k - left) as f32 / denom;
+                filterbank[m * freq_bins + k] = v;
+            }
+        }
+        if center < right {
+            let denom = (right - center) as f32;
+            for k in center..right {
+                let v = (right - k) as f32 / denom;
+                filterbank[m * freq_bins + k] = v;
+            }
+        }
+    }
+
+    filterbank
+}
+
+fn apply_mel_filterbank(
+    power_spec: &[f32],
+    frame_count: usize,
+    freq_bins: usize,
+    n_mels: usize,
+    filterbank: &[f32],
+    apply_log: bool,
+    log_eps: f32,
+) -> Vec<f32> {
+    let mut mel_spec = vec![0.0_f32; frame_count * n_mels];
+
+    for frame in 0..frame_count {
+        let frame_offset = frame * freq_bins;
+        let out_offset = frame * n_mels;
+        for mel in 0..n_mels {
+            let fb_row = mel * freq_bins;
+            let mut acc = 0.0_f32;
+            for k in 0..freq_bins {
+                acc += power_spec[frame_offset + k] * filterbank[fb_row + k];
+            }
+            mel_spec[out_offset + mel] = if apply_log {
+                10.0 * acc.max(log_eps).log10()
+            } else {
+                acc
+            };
+        }
+    }
+
+    mel_spec
+}
+
+#[wasm_bindgen]
+pub fn calc_spectrogram_with_rfft(size: usize, data: &[f32], window: &[f32]) -> Vec<f32> {
+    let (power_spec, frame_count, freq_bins) = calc_power_spectrogram_internal(size, window.len(), data, window);
+    let mut log_spec = Vec::with_capacity(frame_count * freq_bins);
+    // 10log10(sqrt(x)) = 5log10(x)
+    for sq in power_spec {
+        let db = 5.0 * sq.log10();
+        log_spec.push(db);
+    }
+    log_spec
+}
+
+#[wasm_bindgen]
+pub fn calc_power_spectrogram_with_rfft(size: usize, data: &[f32], window: &[f32]) -> Vec<f32> {
+    let (power_spec, _, _) = calc_power_spectrogram_internal(size, window.len(), data, window);
     power_spec
+}
+
+/// Returns mel spectrogram (frame-major) from waveform.
+///
+/// Shape is `frames x n_mels` where
+/// `frames = floor((data.len() - n_fft) / hop_length) + 1`.
+#[wasm_bindgen]
+pub fn calc_mel_spectrogram_with_rfft(
+    n_fft: usize,
+    hop_length: usize,
+    n_mels: usize,
+    sample_rate: f32,
+    f_min: f32,
+    f_max: f32,
+    apply_log: bool,
+    log_eps: f32,
+    data: &[f32],
+    window: &[f32],
+) -> Vec<f32> {
+    assert!(n_fft.is_power_of_two(), "n_fft must be power of 2");
+    assert!(hop_length > 0, "hop_length must be > 0");
+    assert!(n_mels > 0, "n_mels must be > 0");
+    assert!(sample_rate > 0.0, "sample_rate must be > 0");
+    assert!(f_min >= 0.0, "f_min must be >= 0");
+    assert!(f_max > f_min, "f_max must be > f_min");
+    assert!(f_max <= sample_rate * 0.5, "f_max must be <= sample_rate / 2");
+    assert!(log_eps > 0.0, "log_eps must be > 0");
+
+    let (power_spec, frame_count, freq_bins) =
+        calc_power_spectrogram_internal(n_fft, hop_length, data, window);
+    let filterbank = build_mel_filterbank(n_fft, n_mels, sample_rate, f_min, f_max);
+
+    apply_mel_filterbank(
+        &power_spec,
+        frame_count,
+        freq_bins,
+        n_mels,
+        &filterbank,
+        apply_log,
+        log_eps,
+    )
+}
+
+/// Converts frame-major power spectrogram into frame-major mel spectrogram.
+///
+/// `power_spec` shape must be `frames x (n_fft/2 + 1)` in row-major order.
+#[wasm_bindgen]
+pub fn calc_power_to_mel_spectrogram(
+    n_fft: usize,
+    n_mels: usize,
+    sample_rate: f32,
+    f_min: f32,
+    f_max: f32,
+    apply_log: bool,
+    log_eps: f32,
+    power_spec: &[f32],
+) -> Vec<f32> {
+    assert!(n_fft.is_power_of_two(), "n_fft must be power of 2");
+    assert!(n_mels > 0, "n_mels must be > 0");
+    assert!(sample_rate > 0.0, "sample_rate must be > 0");
+    assert!(f_min >= 0.0, "f_min must be >= 0");
+    assert!(f_max > f_min, "f_max must be > f_min");
+    assert!(f_max <= sample_rate * 0.5, "f_max must be <= sample_rate / 2");
+    assert!(log_eps > 0.0, "log_eps must be > 0");
+
+    let freq_bins = n_fft / 2 + 1;
+    assert!(
+        power_spec.len() % freq_bins == 0,
+        "power_spec length ({}) must be a multiple of freq bins ({})",
+        power_spec.len(),
+        freq_bins
+    );
+
+    let frame_count = power_spec.len() / freq_bins;
+    let filterbank = build_mel_filterbank(n_fft, n_mels, sample_rate, f_min, f_max);
+
+    apply_mel_filterbank(
+        power_spec,
+        frame_count,
+        freq_bins,
+        n_mels,
+        &filterbank,
+        apply_log,
+        log_eps,
+    )
 }
 
 #[cfg(test)]
@@ -303,12 +482,91 @@ mod tests {
 
         let result = calc_power_spectrogram_with_rfft(size, &data, &window);
 
-        // 現在の実装では frame=1, bins=size/2+1
-        assert_eq!(result.len(), size / 2 + 1);
-        // 定数 1 入力なら DC のみ N^2、他は 0
-        assert!((result[0] - (size * size) as f32).abs() < 1e-4);
-        for v in result.iter().skip(1) {
-            assert!(v.abs() < 1e-4);
+        let frames = (data.len() - size) / window.len() + 1;
+        let bins = size / 2 + 1;
+        assert_eq!(result.len(), frames * bins);
+
+        // 定数 1 入力なら各フレームで DC のみ N^2、他は 0
+        for frame in 0..frames {
+            let offset = frame * bins;
+            assert!((result[offset] - (size * size) as f32).abs() < 1e-4);
+            for v in result[offset + 1..offset + bins].iter() {
+                assert!(v.abs() < 1e-4);
+            }
+        }
+    }
+
+    #[test]
+    fn mel_matches_power_to_mel_path() {
+        let n_fft = 8;
+        let hop = 8;
+        let n_mels = 4;
+        let sr = 16000.0;
+        let f_min = 0.0;
+        let f_max = 4000.0;
+        let eps = 1e-10;
+        let data = vec![1.0_f32; 16];
+        let window = vec![1.0_f32; n_fft];
+
+        let mel_from_audio = calc_mel_spectrogram_with_rfft(
+            n_fft,
+            hop,
+            n_mels,
+            sr,
+            f_min,
+            f_max,
+            false,
+            eps,
+            &data,
+            &window,
+        );
+
+        let power = calc_power_spectrogram_with_rfft(n_fft, &data, &window);
+        let mel_from_power = calc_power_to_mel_spectrogram(
+            n_fft,
+            n_mels,
+            sr,
+            f_min,
+            f_max,
+            false,
+            eps,
+            &power,
+        );
+
+        assert_eq!(mel_from_audio.len(), mel_from_power.len());
+        for (a, b) in mel_from_audio.iter().zip(mel_from_power.iter()) {
+            assert!((a - b).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn mel_log_uses_eps_floor() {
+        let n_fft = 8;
+        let hop = 4;
+        let n_mels = 4;
+        let sr = 16000.0;
+        let f_min = 0.0;
+        let f_max = 4000.0;
+        let eps = 1e-6;
+        let data = vec![0.0_f32; 16];
+        let window = vec![1.0_f32; n_fft];
+
+        let mel_log = calc_mel_spectrogram_with_rfft(
+            n_fft,
+            hop,
+            n_mels,
+            sr,
+            f_min,
+            f_max,
+            true,
+            eps,
+            &data,
+            &window,
+        );
+
+        let expected = 10.0 * eps.log10();
+        for v in &mel_log {
+            assert!((v - expected).abs() < 1e-5);
         }
     }
 }
