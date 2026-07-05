@@ -228,6 +228,35 @@ pub fn calc_spectrogram_with_rfft(size: usize, data: &[f32], window: &[f32]) -> 
     log_spec
 }
 
+#[wasm_bindgen]
+pub fn calc_power_spectrogram_with_rfft(size: usize, data: &[f32], window: &[f32]) -> Vec<f32> {
+    let data_len = data.len();
+    let window_size = window.len();
+    assert!(window_size > 0, "window_size must be > 0");
+    assert!(
+        data_len >= size,
+        "data length ({}) must be at least fft size ({})",
+        data_len,
+        size
+    );
+    let frame_count = (data_len - size) / window_size + 1;
+    let freq_bins = size / 2 + 1;
+    let mut power_spec = Vec::with_capacity(frame_count * freq_bins);
+    let mut windowed_data = vec![0.0_f32; size];
+    let f = RealFft::new(size);
+    for i in (0..=data_len - size).step_by(window_size) {
+        for j in 0..size {
+            windowed_data[j] = data[i + j] * window[j % window_size];
+        }
+        let spec: Vec<Complex<f32>> = f.rfft(&windowed_data);
+        for c in &spec {
+            let sq = c.re * c.re + c.im * c.im;
+            power_spec.push(sq);
+        }
+    }
+    power_spec
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +294,22 @@ mod tests {
         window.push(1.0);
         window.push(1.0);
         calc_spectrogram_with_rfft(4, &data, &window);
+    }
+    #[test]
+    fn power_spectrogram_returns_sq_values() {
+        let size = 8;
+        let data = vec![1.0_f32; size * 2];
+        let window = vec![1.0_f32; size];
+
+        let result = calc_power_spectrogram_with_rfft(size, &data, &window);
+
+        // 現在の実装では frame=1, bins=size/2+1
+        assert_eq!(result.len(), size / 2 + 1);
+        // 定数 1 入力なら DC のみ N^2、他は 0
+        assert!((result[0] - (size * size) as f32).abs() < 1e-4);
+        for v in result.iter().skip(1) {
+            assert!(v.abs() < 1e-4);
+        }
     }
 }
 
